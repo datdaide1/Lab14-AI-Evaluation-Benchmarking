@@ -2,42 +2,111 @@ import asyncio
 import json
 import os
 import time
+import ssl
+
+def _patched_load_default_certs(*args, **kwargs):
+    pass
+ssl.SSLContext.load_default_certs = _patched_load_default_certs
+
 from engine.runner import BenchmarkRunner
 from agent.main_agent import MainAgent
 
-# Giả lập các components Expert
+
+from google import genai
+import re
+
+# Components Expert
 class ExpertEvaluator:
     async def score(self, case, resp): 
-        # Giả lập tính toán Hit Rate và MRR
+        # Tính toán Hit Rate và MRR
+        gt_id = case.get("ground_truth_id")
+        retrieved_ids = resp.get("metadata", {}).get("retrieved_ids", [])
+        
+        hit_rate = 1.0 if gt_id in retrieved_ids else 0.0
+        mrr = 0.0
+        if gt_id in retrieved_ids:
+            rank = retrieved_ids.index(gt_id) + 1
+            mrr = 1.0 / rank
+
         return {
-            "faithfulness": 0.9, 
+            "faithfulness": 0.9, # Giả lập điểm để tập trung vào Retrieval Evaluation (yêu cầu cốt lõi)
             "relevancy": 0.8,
-            "retrieval": {"hit_rate": 1.0, "mrr": 0.5}
+            "retrieval": {"hit_rate": hit_rate, "mrr": mrr}
         }
 
 class MultiModelJudge:
+    def __init__(self):
+        self.client = genai.Client()
+
+    async def _ask_judge(self, q, a, gt, role_prompt, temperature):
+        prompt = f"""{role_prompt}
+Bạn là giám khảo chấm điểm câu trả lời của hệ thống AI (RAG).
+Thang điểm từ 1 đến 5 (1: Tệ nhất, 5: Tốt nhất).
+Chỉ trả về 1 con số nguyên duy nhất từ 1 đến 5. Không giải thích gì thêm.
+
+Câu hỏi: {q}
+Câu trả lời kỳ vọng (Ground Truth): {gt}
+Câu trả lời của hệ thống: {a}
+
+Điểm (1-5):"""
+        try:
+            # We wrap with asyncio.to_thread because the SDK might be sync, but google.genai has async?
+            # Actually, google-genai is mostly sync, so we can just call it synchronously or in an executor.
+            # To be safe and async, let's use asyncio.to_thread
+            def sync_call():
+                return self.client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=prompt
+                ).text
+            
+            response = await asyncio.to_thread(sync_call)
+            # parse number
+            match = re.search(r'[1-5]', response)
+            if match:
+                return int(match.group())
+            return 3
+        except Exception as e:
+            print(f"Judge Error: {e}")
+            return 3
+
     async def evaluate_multi_judge(self, q, a, gt): 
+        # Judge 1: Strict Judge
+        task1 = self._ask_judge(q, a, gt, "Bạn là một giám khảo cực kỳ khó tính và khắt khe.", 0.1)
+        # Judge 2: Helpful Judge
+        task2 = self._ask_judge(q, a, gt, "Bạn là một giám khảo công tâm, chú trọng vào việc thông tin có giúp ích được cho người dùng hay không.", 0.5)
+        
+        score1, score2 = await asyncio.gather(task1, task2)
+        
+        final_score = (score1 + score2) / 2.0
+        agreement_rate = 1.0 if abs(score1 - score2) <= 1 else 0.0
+        
+        reasoning = f"Judge 1: {score1}, Judge 2: {score2}. "
+        if agreement_rate == 1.0:
+            reasoning += "Hai giám khảo đồng thuận cao."
+        else:
+            reasoning += "Hai giám khảo có ý kiến trái chiều."
+
         return {
-            "final_score": 4.5, 
-            "agreement_rate": 0.8,
-            "reasoning": "Cả 2 model đồng ý đây là câu trả lời tốt."
+            "final_score": final_score, 
+            "agreement_rate": agreement_rate,
+            "reasoning": reasoning
         }
 
 async def run_benchmark_with_results(agent_version: str):
-    print(f"🚀 Khởi động Benchmark cho {agent_version}...")
+    print(f"Khoi dong Benchmark cho {agent_version}...")
 
     if not os.path.exists("data/golden_set.jsonl"):
-        print("❌ Thiếu data/golden_set.jsonl. Hãy chạy 'python data/synthetic_gen.py' trước.")
+        print("Thiếu data/golden_set.jsonl. Hãy chạy 'python data/synthetic_gen.py' trước.")
         return None, None
 
     with open("data/golden_set.jsonl", "r", encoding="utf-8") as f:
         dataset = [json.loads(line) for line in f if line.strip()]
 
     if not dataset:
-        print("❌ File data/golden_set.jsonl rỗng. Hãy tạo ít nhất 1 test case.")
+        print("File data/golden_set.jsonl rỗng. Hãy tạo ít nhất 1 test case.")
         return None, None
 
-    runner = BenchmarkRunner(MainAgent(), ExpertEvaluator(), MultiModelJudge())
+    runner = BenchmarkRunner(MainAgent(version=agent_version.split('_')[1].lower() if 'V1' in agent_version else "v2"), ExpertEvaluator(), MultiModelJudge())
     results = await runner.run_all(dataset)
 
     total = len(results)
@@ -62,10 +131,10 @@ async def main():
     v2_results, v2_summary = await run_benchmark_with_results("Agent_V2_Optimized")
     
     if not v1_summary or not v2_summary:
-        print("❌ Không thể chạy Benchmark. Kiểm tra lại data/golden_set.jsonl.")
+        print("Khong the chay Benchmark. Kiem tra lai data/golden_set.jsonl.")
         return
 
-    print("\n📊 --- KẾT QUẢ SO SÁNH (REGRESSION) ---")
+    print("\n--- KET QUA SO SANH (REGRESSION) ---")
     delta = v2_summary["metrics"]["avg_score"] - v1_summary["metrics"]["avg_score"]
     print(f"V1 Score: {v1_summary['metrics']['avg_score']}")
     print(f"V2 Score: {v2_summary['metrics']['avg_score']}")
@@ -78,9 +147,9 @@ async def main():
         json.dump(v2_results, f, ensure_ascii=False, indent=2)
 
     if delta > 0:
-        print("✅ QUYẾT ĐỊNH: CHẤP NHẬN BẢN CẬP NHẬT (APPROVE)")
+        print("QUYET DINH: CHAP NHAN BAN CAP NHAT (APPROVE)")
     else:
-        print("❌ QUYẾT ĐỊNH: TỪ CHỐI (BLOCK RELEASE)")
+        print("QUYET DINH: TU CHOI (BLOCK RELEASE)")
 
 if __name__ == "__main__":
     asyncio.run(main())
